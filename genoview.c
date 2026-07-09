@@ -7,6 +7,95 @@
 #include <assert.h>
 
 //----------------------------------------------------------------------------------
+// Math
+//----------------------------------------------------------------------------------
+
+static inline float Max(float x, float y)
+{
+    return x > y ? x : y;
+}
+
+static inline float Min(float x, float y)
+{
+    return x < y ? x : y;
+}
+
+// This is a safe version of QuaternionBetween which returns a 180 deg rotation
+// at the singularity where vectors are facing exactly in opposite directions
+static inline Quaternion QuaternionBetween(Vector3 p, Vector3 q)
+{
+    Vector3 c = Vector3CrossProduct(p, q);
+
+    Quaternion o = {
+        c.x,
+        c.y,
+        c.z,
+        sqrtf(Vector3DotProduct(p, p) * Vector3DotProduct(q, q)) + Vector3DotProduct(p, q),
+    };
+    
+    return QuaternionLength(o) < 1e-8f ?
+        QuaternionFromAxisAngle((Vector3){ 1.0f, 0.0f, 0.0f }, PI) :
+        QuaternionNormalize(o);
+}
+
+// Puts the quaternion in the hemisphere closest to the identity
+static inline Quaternion QuaternionAbsolute(Quaternion q)
+{
+    if (q.w < 0.0f)
+    {
+        q.x = -q.x;
+        q.y = -q.y;
+        q.z = -q.z;
+        q.w = -q.w;
+    }
+
+    return q;
+}
+
+// Quaternion exponent, log, and angle axis functions (see: https://theorangeduck.com/page/exponential-map-angle-axis-angular-velocity)
+
+static inline Quaternion QuaternionExp(Vector3 v)
+{
+    float halfangle = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+
+    if (halfangle < 1e-4f)
+    {
+        return QuaternionNormalize((Quaternion){ v.x, v.y, v.z, 1.0f });
+    }
+    else
+    {
+        float c = cosf(halfangle);
+        float s = sinf(halfangle) / halfangle;
+        return (Quaternion){ s * v.x, s * v.y, s * v.z, c };
+    }
+}
+
+static inline Vector3 QuaternionLog(Quaternion q)
+{
+    float length = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z);
+
+    if (length < 1e-4f)
+    {
+        return (Vector3){ q.x, q.y, q.z };
+    }
+    else
+    {
+        float halfangle = atan2f(length, q.w);
+        return Vector3Scale((Vector3){ q.x, q.y, q.z }, halfangle / length);
+    }
+}
+
+static inline Vector3 QuaternionToScaledAngleAxis(Quaternion q)
+{
+    return Vector3Scale(QuaternionLog(q), 2.0f);
+}
+
+static inline Quaternion QuaternionFromScaledAngleAxis(Vector3 v)
+{
+    return QuaternionExp(Vector3Scale(v, 0.5f));
+}
+
+//----------------------------------------------------------------------------------
 // Camera
 //----------------------------------------------------------------------------------
 
@@ -354,52 +443,88 @@ Model LoadGenoModel(const char* fileName)
     return model;
 }
 
-ModelAnimation LoadGenoModelAnimation(const char* fileName)
+static inline int FindModelBoneIndex(Model model, const char* boneName)
 {
-    ModelAnimation animation = { 0 };
-    
-    FILE* f = fopen(fileName, "rb");
-    if (f == NULL)
+    for (int i = 0; i < model.boneCount; i++)
     {
-        TRACELOG(LOG_ERROR, "MODEL ANIMATION Unable to read animation file %s", fileName);
-        return animation;
+        if (strcmp(model.bones[i].name, boneName) == 0)
+        {
+            return i;
+        }
     }
     
-    fread(&animation.frameCount, sizeof(int), 1, f);
-    fread(&animation.boneCount, sizeof(int), 1, f);
-    
-    animation.bones = RL_CALLOC(animation.boneCount, sizeof(BoneInfo));
-    fread(animation.bones, sizeof(BoneInfo), animation.boneCount, f);        
-    
-    animation.framePoses = RL_CALLOC(animation.frameCount, sizeof(Transform*));
-    for (int i = 0; i < animation.frameCount; i++)
-    {
-        animation.framePoses[i] = RL_CALLOC(animation.boneCount, sizeof(Transform));
-        fread(animation.framePoses[i], sizeof(Transform), animation.boneCount, f);        
-    }
-
-    fclose(f);
-    
-    return animation;
+    return -1;
 }
 
-ModelAnimation LoadEmptyModelAnimation(Model model)
+static inline void BackwardKinematics(Transform* localTransforms, Transform* globalTransforms, Model model)
 {
-    ModelAnimation animation = { 0 };
-    animation.frameCount = 1;
-    animation.boneCount = model.boneCount;
-    
-    animation.bones = RL_CALLOC(animation.boneCount, sizeof(BoneInfo));
-    memcpy(animation.bones, model.bones, animation.boneCount * sizeof(BoneInfo));
-    
-    animation.framePoses = RL_CALLOC(animation.frameCount, sizeof(Transform*));
-    for (int i = 0; i < animation.frameCount; i++)
+    for (int i = 0; i < model.boneCount; i++)
     {
-        animation.framePoses[i] = RL_CALLOC(animation.boneCount, sizeof(Transform));
-        memcpy(animation.framePoses[i], model.bindPose, animation.boneCount * sizeof(Transform));
-    }
+        int p = model.bones[i].parent;
 
-    return animation;
+        if (p == -1)
+        {
+            localTransforms[i] = globalTransforms[i];
+        }
+        else
+        {
+            localTransforms[i].translation = 
+                Vector3RotateByQuaternion(
+                    Vector3Subtract(globalTransforms[i].translation, globalTransforms[p].translation), QuaternionInvert(globalTransforms[p].rotation));                
+            localTransforms[i].rotation = QuaternionMultiply(QuaternionInvert(globalTransforms[p].rotation), globalTransforms[i].rotation);
+            globalTransforms[i].scale = (Vector3){ 1.0f, 1.0f, 1.0f };
+        }
+    }
+}
+
+static inline void ForwardKinematics(Transform* globalTransforms, Transform* localTransforms, Model model)
+{
+    for (int i = 0; i < model.boneCount; i++)
+    {
+        int p = model.bones[i].parent;
+
+        if (p == -1)
+        {
+            globalTransforms[i] = localTransforms[i];
+        }
+        else
+        {
+            assert(p < i);
+            
+            globalTransforms[i].translation = Vector3Add(
+                Vector3RotateByQuaternion(localTransforms[i].translation, globalTransforms[p].rotation), 
+                globalTransforms[p].translation);                
+            globalTransforms[i].rotation = QuaternionMultiply(globalTransforms[p].rotation, localTransforms[i].rotation);
+            globalTransforms[i].scale = (Vector3){ 1.0f, 1.0f, 1.0f };
+        }
+    }
+}
+
+static inline void UpdateModelPoseFromTransforms(Model model, Transform* globalTransforms)
+{
+    Matrix bindPoseMatrix = { 0 };
+    Matrix currentPoseMatrix = { 0 };
+
+    // Update all bones and bone matrices of model
+    for (int boneIndex = 0; boneIndex < model.boneCount; boneIndex++)
+    {
+        // Compute runtime bone matrix from model current pose
+        //-----------------------------------------------------------------------------------
+        Transform *bindPoseTransform = &model.bindPose[boneIndex];
+        bindPoseMatrix = MatrixMultiply(
+            MatrixMultiply(MatrixScale(bindPoseTransform->scale.x, bindPoseTransform->scale.y, bindPoseTransform->scale.z),
+                QuaternionToMatrix(bindPoseTransform->rotation)),
+            MatrixTranslate(bindPoseTransform->translation.x, bindPoseTransform->translation.y, bindPoseTransform->translation.z));
+
+        Transform *currentPoseTransform = &globalTransforms[boneIndex];
+        currentPoseMatrix = MatrixMultiply(
+            MatrixMultiply(MatrixScale(currentPoseTransform->scale.x, currentPoseTransform->scale.y, currentPoseTransform->scale.z),
+                QuaternionToMatrix(currentPoseTransform->rotation)),
+            MatrixTranslate(currentPoseTransform->translation.x, currentPoseTransform->translation.y, currentPoseTransform->translation.z));
+
+        model.meshes[0].boneMatrices[boneIndex] = MatrixMultiply(MatrixInvert(bindPoseMatrix), currentPoseMatrix);
+        //-----------------------------------------------------------------------------------
+    }
 }
 
 //----------------------------------------------------------------------------------
@@ -426,50 +551,156 @@ static inline void DrawTransform(Transform t, float scale)
         BLUE);
 }
 
-static inline void DrawModelBindPose(Model model, Color color)
+static inline void DrawTransformThick(Transform t, float scale, float thickness)
+{
+    Matrix rotMatrix = QuaternionToMatrix(t.rotation);
+  
+    DrawCapsule(
+        t.translation,
+        Vector3Add(t.translation, (Vector3){ scale * rotMatrix.m0, scale * rotMatrix.m1, scale * rotMatrix.m2 }),
+        thickness,
+        7, 7,
+        RED);
+        
+    DrawCapsule(
+        t.translation,
+        Vector3Add(t.translation, (Vector3){ scale * rotMatrix.m4, scale * rotMatrix.m5, scale * rotMatrix.m6 }),
+        thickness,
+        7, 7,
+        GREEN);
+        
+    DrawCapsule(
+        t.translation,
+        Vector3Add(t.translation, (Vector3){ scale * rotMatrix.m8, scale * rotMatrix.m9, scale * rotMatrix.m10 }),
+        thickness,
+        7, 7,
+        BLUE);
+}
+
+static inline void DrawModelTransforms(Transform* globalTransforms, Model model, Color color)
 {
     for (int i = 0; i < model.boneCount; i++)
     {
         DrawSphereWires(
-            model.bindPose[i].translation,
+            globalTransforms[i].translation,
             0.01f,
             4,
             6,
             color);
             
-        DrawTransform(model.bindPose[i], 0.1f);
+        DrawTransform(globalTransforms[i], 0.1f);
 
         if (model.bones[i].parent != -1)
         {
             DrawLine3D(
-                model.bindPose[i].translation,
-                model.bindPose[model.bones[i].parent].translation,
+                globalTransforms[i].translation,
+                globalTransforms[model.bones[i].parent].translation,
                 color);
         }
     }
 }
 
-static inline void DrawModelAnimationFrameSkeleton(ModelAnimation animation, int frame, Color color)
+static inline void DrawLegTransforms(
+    Transform* globalTransforms, 
+    Color color,
+    int hipBoneIndex,
+    int kneeBoneIndex,
+    int heelBoneIndex,
+    int toeBoneIndex,
+    int toeEndBoneIndex)
 {
-    for (int i = 0; i < animation.boneCount; i++)
+    DrawTransformThick(globalTransforms[hipBoneIndex], 0.1f, 0.005f);
+    DrawTransformThick(globalTransforms[kneeBoneIndex], 0.1f, 0.005f);
+    DrawTransformThick(globalTransforms[heelBoneIndex], 0.1f, 0.005f);
+    DrawTransformThick(globalTransforms[toeBoneIndex], 0.1f, 0.005f);
+    DrawTransformThick(globalTransforms[toeEndBoneIndex], 0.1f, 0.005f);
+    
+    DrawCapsule(
+        globalTransforms[hipBoneIndex].translation,
+        globalTransforms[kneeBoneIndex].translation,
+        0.0025f,
+        7, 7, color);
+        
+    DrawCapsule(
+        globalTransforms[kneeBoneIndex].translation,
+        globalTransforms[heelBoneIndex].translation,
+        0.0025f,
+        7, 7, color);
+        
+    DrawCapsule(
+        globalTransforms[heelBoneIndex].translation,
+        globalTransforms[toeBoneIndex].translation,
+        0.0025f,
+        7, 7, color);
+        
+    DrawCapsule(
+        globalTransforms[toeBoneIndex].translation,
+        globalTransforms[toeEndBoneIndex].translation,
+        0.0025f,
+        7, 7, color);
+}
+
+//----------------------------------------------------------------------------------
+// Inverse Kinematics
+//----------------------------------------------------------------------------------
+
+static inline void TwoBoneInverseKinematics(
+    Quaternion *localHip,
+    Quaternion *localKnee,
+    Transform globalPelvis, 
+    Transform globalHip, 
+    Transform globalKnee, 
+    Transform globalHeel, 
+    Vector3 targetHeel, 
+    Vector3 sideVector,
+    float maxLengthBuffer)
+{
+    Vector3 targetClamp = targetHeel;
+    float targetLength = Vector3Distance(targetHeel, globalHip.translation);
+
+    float maxExtension = 
+        Vector3Distance(globalHip.translation, globalKnee.translation) + 
+        Vector3Distance(globalKnee.translation, globalHeel.translation) - 
+        maxLengthBuffer;
+
+    if (targetLength > maxExtension)
     {
-        DrawSphereWires(
-            animation.framePoses[frame][i].translation,
-            0.01f,
-            4,
-            6,
-            color);
-
-        DrawTransform(animation.framePoses[frame][i], 0.1f);
-
-        if (animation.bones[i].parent != -1)
-        {
-            DrawLine3D(
-                animation.framePoses[frame][i].translation,
-                animation.framePoses[frame][animation.bones[i].parent].translation,
-                color);
-        }
+        float saturation = (1.0f - expf(-(targetLength - maxExtension) / maxLengthBuffer));
+        
+        targetClamp = Vector3Add(
+            globalHip.translation, 
+            Vector3Scale(Vector3Subtract(targetHeel, globalHip.translation), 
+                (maxExtension + maxLengthBuffer * saturation) / targetLength));        
     }
+    
+    Vector3 axisDwn = Vector3Normalize(Vector3Subtract(globalHeel.translation, globalHip.translation));
+    Vector3 axisFwd = Vector3Normalize(Vector3CrossProduct(axisDwn, sideVector));
+    Vector3 axisRot = Vector3Normalize(Vector3CrossProduct(axisDwn, axisFwd));
+
+    Vector3 a = globalHip.translation;
+    Vector3 b = globalKnee.translation;
+    Vector3 c = globalHeel.translation;
+    Vector3 t = targetClamp;
+    
+    float lab = Vector3Distance(b, a);
+    float lcb = Vector3Distance(b, c);
+    float lat = Vector3Distance(t, a);
+    float lca = Vector3Distance(a, c);
+
+    float acab0 = acosf(Clamp(Vector3DotProduct(Vector3Scale(Vector3Subtract(c, a), 1.0f / lca), Vector3Scale(Vector3Subtract(b, a), 1.0f / lab)), -1.0f, +1.0f));
+    float babc0 = acosf(Clamp(Vector3DotProduct(Vector3Scale(Vector3Subtract(a, b), 1.0f / lab), Vector3Scale(Vector3Subtract(c, b), 1.0f / lcb)), -1.0f, +1.0f));
+
+    float acab1 = acosf(Clamp((lab * lab + lat * lat - lcb * lcb) / (2.0 * lab * lat), -1.0f, +1.0f));
+    float babc1 = acosf(Clamp((lab * lab + lcb * lcb - lat * lat) / (2.0 * lab * lcb), -1.0f, +1.0f));
+
+    Quaternion r0 = QuaternionFromScaledAngleAxis(Vector3Scale(axisRot, acab1 - acab0));
+    Quaternion r1 = QuaternionFromScaledAngleAxis(Vector3Scale(axisRot, babc1 - babc0));
+    Quaternion r2 = QuaternionNormalize(QuaternionBetween(
+        Vector3Subtract(globalHeel.translation, globalHip.translation), 
+        Vector3Subtract(targetClamp, globalHip.translation)));
+    
+    *localHip = QuaternionMultiply(QuaternionMultiply(QuaternionMultiply(QuaternionInvert(globalPelvis.rotation), r2), r0), globalHip.rotation);
+    *localKnee = QuaternionMultiply(QuaternionMultiply(QuaternionInvert(globalHip.rotation), r1), globalKnee.rotation);
 }
 
 //----------------------------------------------------------------------------------
@@ -565,16 +796,7 @@ int main(int argc, char **argv)
     
     Model genoModel = LoadGenoModel("./resources/Geno.bin");
     Vector3 genoPosition = (Vector3){ 0.0f, 0.0f, 0.0f };
-    
-    // Animation
-    
-    // ModelAnimation testAnimation = LoadGenoModelAnimation("./resources/ground1_subject1.bin");
-    //ModelAnimation testAnimation = LoadGenoModelAnimation("./resources/kthstreet_gPO_sFM_cAll_d02_mPO_ch01_atombounce_001.bin");
-    ModelAnimation testAnimation = LoadEmptyModelAnimation(genoModel);
-    int animationFrame = 0;
-    
-    assert(testAnimation.boneCount == genoModel.boneCount);
-    
+        
     // Camera
     
     OrbitCamera camera;
@@ -607,22 +829,159 @@ int main(int argc, char **argv)
     RenderTexture2D ssaoFront = LoadRenderTexture(screenWidth, screenHeight);
     RenderTexture2D ssaoBack = LoadRenderTexture(screenWidth, screenHeight);
     
+    // Animation
+    
+    Transform *localTransforms = RL_CALLOC(genoModel.boneCount, sizeof(Transform));
+    Transform *globalTransforms = RL_CALLOC(genoModel.boneCount, sizeof(Transform));
+    Transform *modifyTransforms = RL_CALLOC(genoModel.boneCount, sizeof(Transform));
+    
+    BackwardKinematics(localTransforms, genoModel.bindPose, genoModel);
+    memcpy(modifyTransforms, localTransforms, genoModel.boneCount * sizeof(Transform));
+    ForwardKinematics(globalTransforms, modifyTransforms, genoModel);
+
+    int pelvisBoneIndex = FindModelBoneIndex(genoModel, "Hips");
+    int leftHipBoneIndex = FindModelBoneIndex(genoModel, "LeftUpLeg");
+    int leftKneeBoneIndex = FindModelBoneIndex(genoModel, "LeftLeg");
+    int leftHeelBoneIndex = FindModelBoneIndex(genoModel, "LeftFoot");
+    int leftToeBoneIndex = FindModelBoneIndex(genoModel, "LeftToeBase");
+    int leftToeEndBoneIndex = FindModelBoneIndex(genoModel, "LeftToeBaseEnd");
+
+    Vector3 target = globalTransforms[leftToeBoneIndex].translation;
+    Vector3 targetHeel = globalTransforms[leftHeelBoneIndex].translation;
+    Vector3 targetToe = globalTransforms[leftToeBoneIndex].translation;
+    Vector3 targetToeEnd = globalTransforms[leftToeEndBoneIndex].translation;
+    
+    float heelMinHeight = globalTransforms[leftHeelBoneIndex].translation.y;
+    float toeMinHeight = globalTransforms[leftToeBoneIndex].translation.y;
+    float toeEndMinHeight = globalTransforms[leftToeEndBoneIndex].translation.y;
+    
     // UI
     
     bool drawBoneTransforms = false;
+    bool drawLeg = true;
+    bool drawDebug = true;
+    
+    bool enableInverseKinematics = true;
+    float pelvisOffset = 0.0f;
+    float maxLengthBuffer = 0.005f; 
+    bool enableHeelLookAt = true;
+    bool enableToeLookAt = true;
+    bool enableHeightClamp = true;
     
     // Go
     
     while (!WindowShouldClose())
     {
-        // Animation
+        // Inverse Kinematics
         
-        animationFrame = (animationFrame + 1) % testAnimation.frameCount;
-        UpdateModelAnimationBones(genoModel, testAnimation, animationFrame);
+        memcpy(modifyTransforms, localTransforms, genoModel.boneCount * sizeof(Transform));
+        
+        // Apply Pelvis Offset
+        
+        modifyTransforms[pelvisBoneIndex].translation.y -= pelvisOffset;
+        
+        ForwardKinematics(globalTransforms, modifyTransforms, genoModel);
 
+        // Move and Clamp Toe Target
+
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
+            Ray clickRay = GetScreenToWorldRay(GetMousePosition(), camera.cam3d);
+            
+            target = Vector3Add(clickRay.position, 
+                Vector3Scale(clickRay.direction, 
+                Vector3Distance(target, camera.cam3d.position)));
+        }
+        
+        if (enableInverseKinematics)
+        {
+            targetToe = target;
+            
+            if (enableHeightClamp)
+            {
+                targetToe.y = Max(targetToe.y, toeMinHeight);   
+            }
+            
+            // Find the Heel Target Location
+
+            targetHeel = Vector3Add(targetToe, Vector3Subtract(
+                globalTransforms[leftHeelBoneIndex].translation, 
+                globalTransforms[leftToeBoneIndex].translation));
+
+            if (enableHeightClamp)
+            {
+                targetHeel.y = Max(targetHeel.y, heelMinHeight);
+            }
+            
+            // Solve Two-Bone Inverse Kinematics to place heel
+            
+            Vector3 sideVector = Vector3RotateByQuaternion(
+                (Vector3){ 1.0f, 0.0f, 0.0f }, 
+                globalTransforms[leftKneeBoneIndex].rotation);
+            
+            Quaternion modifiedHip, modifiedKnee;
+            
+            TwoBoneInverseKinematics(
+                &modifiedHip, 
+                &modifiedKnee, 
+                globalTransforms[pelvisBoneIndex], 
+                globalTransforms[leftHipBoneIndex], 
+                globalTransforms[leftKneeBoneIndex], 
+                globalTransforms[leftHeelBoneIndex], 
+                targetHeel, 
+                sideVector,
+                maxLengthBuffer);
+                
+            modifyTransforms[leftHipBoneIndex].rotation = modifiedHip;
+            modifyTransforms[leftKneeBoneIndex].rotation = modifiedKnee;
+            
+            // Orient Toe towards Target
+            
+            if (enableHeelLookAt)
+            {
+                ForwardKinematics(globalTransforms, modifyTransforms, genoModel);
+                
+                Quaternion leftHeelRotation = QuaternionMultiply(QuaternionNormalize(QuaternionBetween(
+                    Vector3Subtract(globalTransforms[leftToeBoneIndex].translation, globalTransforms[leftHeelBoneIndex].translation),
+                    Vector3Subtract(targetToe, globalTransforms[leftHeelBoneIndex].translation))), 
+                    globalTransforms[leftHeelBoneIndex].rotation);
+
+                modifyTransforms[leftHeelBoneIndex].rotation = QuaternionMultiply(QuaternionInvert(globalTransforms[leftKneeBoneIndex].rotation), leftHeelRotation);
+            }
+            
+            // Orient Toe-End
+            
+            if (enableToeLookAt)
+            {          
+                ForwardKinematics(globalTransforms, modifyTransforms, genoModel);
+                
+                targetToeEnd = globalTransforms[leftToeEndBoneIndex].translation;
+                
+                if (enableHeightClamp)
+                {
+                    targetToeEnd.y = Max(targetToeEnd.y, toeEndMinHeight);
+                }
+                
+                Quaternion leftToeRotation = QuaternionMultiply(QuaternionNormalize(QuaternionBetween(
+                    Vector3Subtract(globalTransforms[leftToeEndBoneIndex].translation, globalTransforms[leftToeBoneIndex].translation),
+                    Vector3Subtract(targetToeEnd, globalTransforms[leftToeBoneIndex].translation))), 
+                    globalTransforms[leftToeBoneIndex].rotation);
+
+                modifyTransforms[leftToeBoneIndex].rotation = QuaternionMultiply(QuaternionInvert(globalTransforms[leftHeelBoneIndex].rotation), leftToeRotation);
+            }
+            
+            // Recompute final global transforms
+            
+            ForwardKinematics(globalTransforms, modifyTransforms, genoModel);
+        }
+        
+        // Update bone transforms
+        
+        UpdateModelPoseFromTransforms(genoModel, globalTransforms);
+        
         // Shadow Light Tracks Character
         
-        Vector3 hipPosition = testAnimation.framePoses[animationFrame][0].translation;
+        Vector3 hipPosition = (Vector3){ 0.0f, 0.5f, 0.0f };
         
         shadowLight.target = (Vector3){ hipPosition.x, 0.0f, hipPosition.z };
         shadowLight.position = Vector3Add(shadowLight.target, Vector3Scale(lightDir, -5.0f));
@@ -827,7 +1186,38 @@ int main(int argc, char **argv)
         
         if (drawBoneTransforms)
         {
-            DrawModelAnimationFrameSkeleton(testAnimation, animationFrame, GRAY);
+            DrawModelTransforms(globalTransforms, genoModel, GRAY);
+        }
+        
+        if (drawLeg)
+        {
+            DrawLegTransforms(
+                globalTransforms, 
+                GRAY,
+                leftHipBoneIndex,
+                leftKneeBoneIndex,
+                leftHeelBoneIndex,
+                leftToeBoneIndex,
+                leftToeEndBoneIndex);
+        }
+        
+        if (drawDebug)
+        {
+            DrawSphere(target, 0.0125f, GOLD);
+            
+            DrawSphere(targetHeel, 0.02f, PINK);
+            DrawSphere(targetToe, 0.02f, PINK);
+            DrawCapsule(targetToe, targetHeel, 0.01f, 7, 7, PINK);
+            
+            DrawSphere(globalTransforms[leftHeelBoneIndex].translation, 0.015f, PURPLE);
+            DrawSphere(globalTransforms[leftToeBoneIndex].translation, 0.015f, PURPLE);
+            DrawSphere(globalTransforms[leftToeEndBoneIndex].translation, 0.015f, PURPLE);
+            DrawCapsule(
+                globalTransforms[leftHeelBoneIndex].translation, 
+                globalTransforms[leftToeBoneIndex].translation, 0.0075f, 7, 7, PURPLE);
+            DrawCapsule(
+                globalTransforms[leftToeBoneIndex].translation, 
+                globalTransforms[leftToeEndBoneIndex].translation, 0.0075f, 7, 7, PURPLE);
         }
   
         EndMode3D();
@@ -866,13 +1256,27 @@ int main(int argc, char **argv)
         GuiLabel((Rectangle){ 30, 140, 150, 20 }, TextFormat("Altitude: %5.3f", camera.altitude));
         GuiLabel((Rectangle){ 30, 160, 150, 20 }, TextFormat("Distance: %5.3f", camera.distance));
   
-        GuiGroupBox((Rectangle){ screenWidth - 260, 10, 240, 40 }, "Rendering");
+        GuiGroupBox((Rectangle){ screenWidth - 260, 10, 240, 100 }, "Rendering");
 
         GuiCheckBox((Rectangle){ screenWidth - 250, 20, 20, 20 }, "Draw Transforms", &drawBoneTransforms);
+        GuiCheckBox((Rectangle){ screenWidth - 250, 50, 20, 20 }, "Draw Leg", &drawLeg);
+        GuiCheckBox((Rectangle){ screenWidth - 250, 80, 20, 20 }, "Draw Debug", &drawDebug);
 
+        GuiGroupBox((Rectangle){ screenWidth - 260, 120, 240, 200 }, "Inverse Kinematics");
+
+        GuiCheckBox((Rectangle){ screenWidth - 250, 130, 20, 20 }, "Enable", &enableInverseKinematics);
+        GuiSlider((Rectangle){ screenWidth - 250 + 90, 160, 100, 20 }, "Pelvis Offset", TextFormat("%4.4f", pelvisOffset), &pelvisOffset, 0.0f, 0.1f);
+        GuiSlider((Rectangle){ screenWidth - 250 + 90, 190, 100, 20 }, "Extension Buffer", TextFormat("%4.4f", maxLengthBuffer), &maxLengthBuffer, 0.0f, 0.025f);
+        GuiCheckBox((Rectangle){ screenWidth - 250, 220, 20, 20 }, "Heel Look-At", &enableHeelLookAt);
+        GuiCheckBox((Rectangle){ screenWidth - 250, 250, 20, 20 }, "Toe Look-At", &enableToeLookAt);
+        GuiCheckBox((Rectangle){ screenWidth - 250, 280, 20, 20 }, "Height Clamp", &enableHeightClamp);
   
         EndDrawing();
     }
+
+    RL_FREE(localTransforms);
+    RL_FREE(globalTransforms);
+    RL_FREE(modifyTransforms);
 
     UnloadRenderTexture(lighted);
     UnloadRenderTexture(ssaoBack);
@@ -881,8 +1285,6 @@ int main(int argc, char **argv)
     UnloadGBuffer(gbuffer);
 
     UnloadShadowMap(shadowMap);
-    
-    UnloadModelAnimation(testAnimation);
     
     UnloadModel(genoModel);
     UnloadModel(groundModel);

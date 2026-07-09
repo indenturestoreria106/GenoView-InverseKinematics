@@ -74,7 +74,7 @@ def load(filename, order=None):
                 order = "".join([channelmap[p] for p in parts])
             continue
 
-        jmatch = re.match("\s*JOINT\s+(\w+)", line)
+        jmatch = re.match(r"\s*JOINT\s+(\w+)", line)
         if jmatch:
             names.append(jmatch.group(1))
             offsets = np.append(offsets, np.array([[0, 0, 0]]), axis=0)
@@ -87,14 +87,14 @@ def load(filename, order=None):
             end_site = True
             continue
 
-        fmatch = re.match("\s*Frames:\s+(\d+)", line)
+        fmatch = re.match(r"\s*Frames:\s+(\d+)", line)
         if fmatch:
             fnum = int(fmatch.group(1))
             positions = offsets[np.newaxis].repeat(fnum, axis=0)
             rotations = np.zeros((fnum, len(orients), 3))
             continue
 
-        fmatch = re.match("\s*Frame Time:\s+([\d\.]+)", line)
+        fmatch = re.match(r"\s*Frame Time:\s+([\d\.]+)", line)
         if fmatch:
             frametime = float(fmatch.group(1))
             continue

